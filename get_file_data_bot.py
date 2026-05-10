@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import inspect
 import json
 import logging
 import os
 import sys
+from functools import wraps
 from typing import Any, Callable
 
 try:
@@ -42,6 +44,10 @@ TARGET_KEYS = {
     "name",
     "size",
     "mime_type",
+    "voice",
+    "audio",
+    "duration",
+    "transcription",
 }
 
 MESSAGE_PART_LIMIT = 3000
@@ -153,6 +159,24 @@ def safe_json_dumps(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, default=str)
 
 
+def debug_event_type(event: Any) -> str:
+    return f"{type(event).__module__}.{type(event).__name__}"
+
+
+def log_handler_entry(handler_name: str, event: Any) -> None:
+    logger.info("[DEBUG] handler entered: %s", handler_name)
+    logger.info("[DEBUG] raw event type: %s", debug_event_type(event))
+    logger.info("[DEBUG] raw event object: %r", event)
+    logger.info("[DEBUG] raw event JSON:\n%s", safe_json_dumps(object_to_plain_data(event)))
+
+
+def log_raw_event(source_name: str, event: Any) -> None:
+    logger.info("[DEBUG] raw event source: %s", source_name)
+    logger.info("[DEBUG] raw event type: %s", debug_event_type(event))
+    logger.info("[DEBUG] raw event object: %r", event)
+    logger.info("[DEBUG] raw event JSON:\n%s", safe_json_dumps(object_to_plain_data(event)))
+
+
 def mask_token(token: Any) -> str:
     """
     В обычном логе маскирует token, но в ответ пользователю показывает полный token,
@@ -255,6 +279,24 @@ def get_message_text(data: Any) -> str:
             if nested_text:
                 return nested_text
     return ""
+
+
+def event_dedupe_key(data: Any) -> str:
+    if isinstance(data, dict):
+        for key in ("update_id", "message_id", "event_id", "callback_id", "id"):
+            value = data.get(key)
+            if value is not None:
+                return f"{key}:{value}"
+
+        for nested_key in ("message", "callback", "update", "event"):
+            nested = data.get(nested_key)
+            if isinstance(nested, dict):
+                nested_key_value = event_dedupe_key(nested)
+                if nested_key_value:
+                    return f"{nested_key}:{nested_key_value}"
+
+    digest = hashlib.sha256(safe_json_dumps(data).encode("utf-8", errors="replace")).hexdigest()
+    return f"sha256:{digest}"
 
 
 def extract_user_message_object(event_or_message: Any) -> Any:
@@ -414,8 +456,23 @@ def is_admin_allowed(user_id: Any, admin_ids: set[int]) -> bool:
         return False
 
 
-def make_handlers(bot: Any, admin_ids: set[int]) -> tuple[Callable[..., Any], Callable[..., Any]]:
+def make_handlers(bot: Any, admin_ids: set[int]) -> tuple[Callable[..., Any], Callable[..., Any], Callable[..., Any]]:
+    no_attachment_replies_sent: set[str] = set()
+
+    async def send_no_attachment_debug_reply(message: Any, data: Any) -> None:
+        key = event_dedupe_key(data)
+        if key in no_attachment_replies_sent:
+            logger.info("[DEBUG] no-attachment reply already sent for event key=%s", key)
+            return
+        no_attachment_replies_sent.add(key)
+        await send_text(
+            bot,
+            message,
+            "Событие получено, но вложение не найдено. Смотри raw в логах.",
+        )
+
     async def handle_start(message: Any, *args: Any, **kwargs: Any) -> None:
+        log_handler_entry("handle_start", message)
         try:
             event_data = object_to_plain_data(message)
             data = object_to_plain_data(extract_user_message_object(message))
@@ -433,6 +490,7 @@ def make_handlers(bot: Any, admin_ids: set[int]) -> tuple[Callable[..., Any], Ca
             logger.exception("Failed to handle /start")
 
     async def handle_any_message(message: Any, *args: Any, **kwargs: Any) -> None:
+        log_handler_entry("handle_any_message", message)
         try:
             event_data = object_to_plain_data(message)
             data = object_to_plain_data(extract_user_message_object(message))
@@ -451,11 +509,7 @@ def make_handlers(bot: Any, admin_ids: set[int]) -> tuple[Callable[..., Any], Ca
             logger.info("Raw MAX message object:\n%s", safe_json_dumps(data))
 
             if not has_attachments:
-                await send_text(
-                    bot,
-                    message,
-                    "Пришлите аудиофайл или документ. Я попробую достать file_id/token из вложения.",
-                )
+                await send_no_attachment_debug_reply(message, data)
                 return
 
             found = find_keys_recursive(data, TARGET_KEYS)
@@ -470,75 +524,289 @@ def make_handlers(bot: Any, admin_ids: set[int]) -> tuple[Callable[..., Any], Ca
             except Exception:
                 logger.exception("Failed to send processing error to user")
 
-    return handle_start, handle_any_message
+    async def handle_debug_event(event: Any, *args: Any, **kwargs: Any) -> None:
+        log_handler_entry("handle_debug_event", event)
+        if args:
+            logger.info("[DEBUG] handler args JSON:\n%s", safe_json_dumps(object_to_plain_data(args)))
+        if kwargs:
+            logger.info("[DEBUG] handler kwargs JSON:\n%s", safe_json_dumps(object_to_plain_data(kwargs)))
+
+        try:
+            event_data = object_to_plain_data(event)
+            data = object_to_plain_data(extract_user_message_object(event))
+            user_id = get_user_id(event_data) or get_user_id(data)
+            if not is_admin_allowed(user_id, admin_ids):
+                logger.warning("Ignoring debug event reply from non-admin user_id=%s", user_id)
+                return
+
+            if not looks_like_attachment_data(data):
+                await send_no_attachment_debug_reply(event, data)
+        except Exception:
+            logger.exception("Failed to handle debug event")
+
+    return handle_start, handle_any_message, handle_debug_event
 
 
-def register_handlers(dispatcher: Any, start_handler: Callable[..., Any], any_handler: Callable[..., Any]) -> None:
+def try_register_decorator(
+    dispatcher: Any,
+    method_name: str,
+    handler: Callable[..., Any],
+    *decorator_args: Any,
+    **decorator_kwargs: Any,
+) -> bool:
+    method = getattr(dispatcher, method_name, None)
+    if not callable(method):
+        return False
+
+    attempts: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...] = (
+        (decorator_args, decorator_kwargs),
+        ((), decorator_kwargs),
+        (decorator_args, {}),
+        ((), {}),
+    )
+    for args, kwargs in attempts:
+        try:
+            decorator = method(*args, **kwargs)
+            if callable(decorator):
+                decorator(handler)
+                logger.info("Handler %s registered via dispatcher.%s", handler.__name__, method_name)
+                return True
+        except TypeError as exc:
+            logger.debug("dispatcher.%s decorator attempt failed: %s", method_name, exc)
+        except Exception:
+            logger.exception("dispatcher.%s decorator registration failed", method_name)
+    return False
+
+
+def try_register_direct(dispatcher: Any, method_name: str, handler: Callable[..., Any]) -> bool:
+    method = getattr(dispatcher, method_name, None)
+    if not callable(method):
+        return False
+
+    attempts: tuple[tuple[tuple[Any, ...], dict[str, Any]], ...] = (
+        ((handler,), {}),
+        ((), {"handler": handler}),
+        ((), {"callback": handler}),
+        (("message", handler), {}),
+        (("update", handler), {}),
+        (("raw_update", handler), {}),
+        (("*", handler), {}),
+    )
+    for args, kwargs in attempts:
+        try:
+            result = method(*args, **kwargs)
+            if callable(result) and result is not handler:
+                result(handler)
+            logger.info("Handler %s registered via dispatcher.%s", handler.__name__, method_name)
+            return True
+        except TypeError as exc:
+            logger.debug("dispatcher.%s direct attempt failed: %s", method_name, exc)
+        except Exception:
+            logger.exception("dispatcher.%s direct registration failed", method_name)
+    return False
+
+
+def log_dispatcher_capabilities(dispatcher: Any) -> None:
+    callable_names = []
+    for name in sorted(dir(dispatcher)):
+        if name.startswith("__"):
+            continue
+        try:
+            attr = getattr(dispatcher, name)
+        except Exception:
+            continue
+        if callable(attr):
+            try:
+                signature = str(inspect.signature(attr))
+            except Exception:
+                signature = "(signature unavailable)"
+            callable_names.append(f"{name}{signature}")
+    logger.info("[DEBUG] Dispatcher type: %s", debug_event_type(dispatcher))
+    logger.info("[DEBUG] Dispatcher callable API:\n%s", "\n".join(callable_names))
+
+
+def wrap_dispatcher_debug_methods(dispatcher: Any) -> None:
+    candidate_names = (
+        "dispatch",
+        "_dispatch",
+        "feed_update",
+        "_feed_update",
+        "process_update",
+        "_process_update",
+        "handle_update",
+        "_handle_update",
+        "handle_event",
+        "_handle_event",
+        "emit",
+        "_emit",
+        "update",
+        "raw_update",
+    )
+
+    for method_name in candidate_names:
+        method = getattr(dispatcher, method_name, None)
+        if not callable(method) or getattr(method, "_max_debug_wrapped", False):
+            continue
+
+        if inspect.iscoroutinefunction(method):
+            @wraps(method)
+            async def async_wrapper(*args: Any, __method: Callable[..., Any] = method, __name: str = method_name, **kwargs: Any) -> Any:
+                logger.info("[DEBUG] dispatcher.%s entered", __name)
+                if args:
+                    log_raw_event(f"dispatcher.{__name}.args", args)
+                if kwargs:
+                    log_raw_event(f"dispatcher.{__name}.kwargs", kwargs)
+                return await __method(*args, **kwargs)
+
+            setattr(async_wrapper, "_max_debug_wrapped", True)
+            try:
+                setattr(dispatcher, method_name, async_wrapper)
+                logger.info("[DEBUG] Wrapped dispatcher.%s for raw logging", method_name)
+            except Exception:
+                logger.exception("Failed to wrap dispatcher.%s", method_name)
+        else:
+            @wraps(method)
+            def sync_wrapper(*args: Any, __method: Callable[..., Any] = method, __name: str = method_name, **kwargs: Any) -> Any:
+                logger.info("[DEBUG] dispatcher.%s entered", __name)
+                if args:
+                    log_raw_event(f"dispatcher.{__name}.args", args)
+                if kwargs:
+                    log_raw_event(f"dispatcher.{__name}.kwargs", kwargs)
+                return __method(*args, **kwargs)
+
+            setattr(sync_wrapper, "_max_debug_wrapped", True)
+            try:
+                setattr(dispatcher, method_name, sync_wrapper)
+                logger.info("[DEBUG] Wrapped dispatcher.%s for raw logging", method_name)
+            except Exception:
+                logger.exception("Failed to wrap dispatcher.%s", method_name)
+
+
+def wrap_bot_polling_debug_methods(bot: Any) -> None:
+    candidate_names = (
+        "get_updates",
+        "get_update",
+        "updates",
+        "poll",
+        "long_poll",
+        "long_polling",
+        "listen",
+        "request",
+        "_request",
+    )
+
+    for method_name in candidate_names:
+        method = getattr(bot, method_name, None)
+        if not callable(method) or getattr(method, "_max_debug_wrapped", False):
+            continue
+
+        if inspect.iscoroutinefunction(method):
+            @wraps(method)
+            async def async_wrapper(*args: Any, __method: Callable[..., Any] = method, __name: str = method_name, **kwargs: Any) -> Any:
+                logger.info("[DEBUG] bot.%s entered", __name)
+                if args:
+                    log_raw_event(f"bot.{__name}.args", args)
+                if kwargs:
+                    log_raw_event(f"bot.{__name}.kwargs", kwargs)
+                result = await __method(*args, **kwargs)
+                log_raw_event(f"bot.{__name}.result", result)
+                return result
+
+            setattr(async_wrapper, "_max_debug_wrapped", True)
+            try:
+                setattr(bot, method_name, async_wrapper)
+                logger.info("[DEBUG] Wrapped bot.%s for polling/raw logging", method_name)
+            except Exception:
+                logger.exception("Failed to wrap bot.%s", method_name)
+        else:
+            @wraps(method)
+            def sync_wrapper(*args: Any, __method: Callable[..., Any] = method, __name: str = method_name, **kwargs: Any) -> Any:
+                logger.info("[DEBUG] bot.%s entered", __name)
+                if args:
+                    log_raw_event(f"bot.{__name}.args", args)
+                if kwargs:
+                    log_raw_event(f"bot.{__name}.kwargs", kwargs)
+                result = __method(*args, **kwargs)
+                log_raw_event(f"bot.{__name}.result", result)
+                return result
+
+            setattr(sync_wrapper, "_max_debug_wrapped", True)
+            try:
+                setattr(bot, method_name, sync_wrapper)
+                logger.info("[DEBUG] Wrapped bot.%s for polling/raw logging", method_name)
+            except Exception:
+                logger.exception("Failed to wrap bot.%s", method_name)
+
+
+def register_handlers(
+    dispatcher: Any,
+    start_handler: Callable[..., Any],
+    any_handler: Callable[..., Any],
+    debug_handler: Callable[..., Any],
+) -> None:
     """
     Register handlers against common dispatcher APIs used by bot frameworks.
     maxapi versions differ, so this keeps the temporary bot autonomous.
     """
-    message_created = getattr(dispatcher, "message_created", None)
-    if callable(message_created):
-        try:
-            message_created(Command("start"))(start_handler)
-            message_created()(any_handler)
-            logger.info("Handlers registered via dispatcher.message_created")
-            return
-        except TypeError:
-            try:
-                message_created(commands=["start"])(start_handler)
-                message_created()(any_handler)
-                logger.info("Handlers registered via dispatcher.message_created")
-                return
-            except TypeError:
-                pass
+    log_dispatcher_capabilities(dispatcher)
 
-    message_attr = getattr(dispatcher, "message", None)
-    if callable(message_attr):
-        try:
-            message_attr(commands=["start"])(start_handler)
-            message_attr()(any_handler)
-            logger.info("Handlers registered via dispatcher.message decorator")
-            return
-        except TypeError:
-            try:
-                message_attr(command="start")(start_handler)
-                message_attr()(any_handler)
-                logger.info("Handlers registered via dispatcher.message decorator")
-                return
-            except TypeError:
-                pass
-
-    for method_name in ("message_handler", "message"):
-        method = getattr(dispatcher, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            method(commands=["start"])(start_handler)
-            method()(any_handler)
-            logger.info("Handlers registered via dispatcher.%s decorator", method_name)
-            return
-        except TypeError:
-            continue
+    registered_message = False
+    for method_name in ("message_created", "message", "message_handler"):
+        registered_message = (
+            try_register_decorator(dispatcher, method_name, start_handler, Command("start"))
+            or try_register_decorator(dispatcher, method_name, start_handler, commands=["start"])
+            or try_register_decorator(dispatcher, method_name, start_handler, command="start")
+            or registered_message
+        )
+        registered_message = try_register_decorator(dispatcher, method_name, any_handler) or registered_message
 
     for method_name in ("add_handler", "register_message_handler", "register_handler"):
-        method = getattr(dispatcher, method_name, None)
-        if not callable(method):
-            continue
-        try:
-            method(start_handler)
-            method(any_handler)
-            logger.info("Handlers registered via dispatcher.%s", method_name)
-            return
-        except TypeError:
-            continue
+        registered_message = try_register_direct(dispatcher, method_name, start_handler) or registered_message
+        registered_message = try_register_direct(dispatcher, method_name, any_handler) or registered_message
 
-    logger.warning(
-        "Could not auto-register handlers. Dispatcher type=%s, maxapi=%s",
-        type(dispatcher),
-        getattr(maxapi, "__version__", "unknown"),
-    )
+    registered_debug = False
+    for method_name in (
+        "any_event",
+        "event",
+        "update",
+        "raw_update",
+        "unknown",
+        "default",
+        "message_callback",
+        "callback",
+        "callback_query",
+        "message_created",
+    ):
+        registered_debug = try_register_decorator(dispatcher, method_name, debug_handler) or registered_debug
+
+    for method_name in (
+        "register_event_handler",
+        "register_update_handler",
+        "register_raw_update_handler",
+        "register_unknown_handler",
+        "register_default_handler",
+        "register_callback_handler",
+        "add_event_handler",
+        "add_update_handler",
+        "add_raw_update_handler",
+        "add_handler",
+        "register_handler",
+    ):
+        registered_debug = try_register_direct(dispatcher, method_name, debug_handler) or registered_debug
+
+    if not registered_message:
+        logger.warning(
+            "Could not auto-register message handlers. Dispatcher type=%s, maxapi=%s",
+            type(dispatcher),
+            getattr(maxapi, "__version__", "unknown"),
+        )
+
+    if not registered_debug:
+        logger.warning(
+            "Could not register universal raw/default/debug handler; falling back to dispatcher method wrappers"
+        )
+
+    wrap_dispatcher_debug_methods(dispatcher)
 
 
 async def start_polling(dispatcher: Any, bot: Any) -> None:
@@ -565,8 +833,9 @@ def main() -> None:
         bot = Bot(token)
 
     dispatcher = Dispatcher()
-    start_handler, any_handler = make_handlers(bot, admin_ids)
-    register_handlers(dispatcher, start_handler, any_handler)
+    wrap_bot_polling_debug_methods(bot)
+    start_handler, any_handler, debug_handler = make_handlers(bot, admin_ids)
+    register_handlers(dispatcher, start_handler, any_handler, debug_handler)
 
     logger.info("Polling started via maxapi.Dispatcher.start_polling(bot)")
     try:
